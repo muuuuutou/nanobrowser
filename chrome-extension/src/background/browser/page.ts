@@ -15,21 +15,14 @@ import {
   getClickableElements as _getClickableElements,
   removeHighlights as _removeHighlights,
   getScrollInfo as _getScrollInfo,
-  getMarkdownContent as _getMarkdownContent,
-  getReadabilityContent as _getReadabilityContent,
-} from '../dom/service';
-import { DOMElementNode, type DOMState } from '../dom/views';
-import { type BrowserContextConfig, DEFAULT_BROWSER_CONTEXT_CONFIG, type PageState } from './types';
+} from './dom/service';
+import { DOMElementNode, type DOMState } from './dom/views';
+import { type BrowserContextConfig, DEFAULT_BROWSER_CONTEXT_CONFIG, type PageState, URLNotAllowedError } from './views';
 import { createLogger } from '@src/background/log';
-import { use } from 'react/ts5.0';
+import { ClickableElementProcessor } from './dom/clickable/service';
+import { isUrlAllowed } from './util';
 
 const logger = createLogger('Page');
-
-declare global {
-  interface Window {
-    turn2Markdown: (selector?: string) => string;
-  }
-}
 
 export function build_initial_state(tabId?: number, url?: string, title?: string): PageState {
   return {
@@ -46,9 +39,23 @@ export function build_initial_state(tabId?: number, url?: string, title?: string
     url: url || '',
     title: title || '',
     screenshot: null,
-    pixelsAbove: 0,
-    pixelsBelow: 0,
+    scrollY: 0,
+    scrollHeight: 0,
+    visualViewportHeight: 0,
   };
+}
+
+/**
+ * Cached clickable elements hashes for the last state
+ */
+export class CachedStateClickableElementsHashes {
+  url: string;
+  hashes: Set<string>;
+
+  constructor(url: string, hashes: Set<string>) {
+    this.url = url;
+    this.hashes = hashes;
+  }
 }
 
 export default class Page {
@@ -58,13 +65,21 @@ export default class Page {
   private _config: BrowserContextConfig;
   private _state: PageState;
   private _validWebPage = false;
+  private _cachedState: PageState | null = null;
+  private _cachedStateClickableElementsHashes: CachedStateClickableElementsHashes | null = null;
 
   constructor(tabId: number, url: string, title: string, config: Partial<BrowserContextConfig> = {}) {
     this._tabId = tabId;
     this._config = { ...DEFAULT_BROWSER_CONTEXT_CONFIG, ...config };
     this._state = build_initial_state(tabId, url, title);
-    // chrome://newtab/, chrome://newtab/extensions are not valid web pages, can't be attached
-    this._validWebPage = (tabId && url && url.startsWith('http')) || false;
+    // chrome://newtab/, chrome://newtab/extensions, https://chromewebstore.google.com/ are not valid web pages, can't be attached
+    const lowerCaseUrl = url.trim().toLowerCase();
+    this._validWebPage =
+      (tabId &&
+        lowerCaseUrl &&
+        lowerCaseUrl.startsWith('http') &&
+        !lowerCaseUrl.startsWith('https://chromewebstore.google.com')) ||
+      false;
   }
 
   get tabId(): number {
@@ -158,29 +173,158 @@ export default class Page {
   }
 
   async removeHighlight(): Promise<void> {
-    if (this._config.highlightElements && this._validWebPage) {
+    if (this._config.displayHighlights && this._validWebPage) {
       await _removeHighlights(this._tabId);
     }
   }
 
-  async getClickableElements(focusElement: number): Promise<DOMState | null> {
+  async getClickableElements(showHighlightElements: boolean, focusElement: number): Promise<DOMState | null> {
     if (!this._validWebPage) {
       return null;
     }
     return _getClickableElements(
       this._tabId,
-      this._config.highlightElements,
+      this.url(),
+      showHighlightElements,
       focusElement,
       this._config.viewportExpansion,
     );
   }
 
   // Get scroll position information for the current page.
-  async getScrollInfo(): Promise<[number, number]> {
+  async getScrollInfo(): Promise<[number, number, number]> {
     if (!this._validWebPage) {
-      return [0, 0];
+      return [0, 0, 0];
     }
     return _getScrollInfo(this._tabId);
+  }
+
+  // Get scroll position information for a specific element.
+  async getElementScrollInfo(elementNode: DOMElementNode): Promise<[number, number, number]> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+
+    const element = await this.locateElement(elementNode);
+    if (!element) {
+      throw new Error(`Element: ${elementNode} not found`);
+    }
+
+    // Find the nearest scrollable ancestor
+    const scrollableElement = await this._findNearestScrollableElement(element);
+    if (!scrollableElement) {
+      throw new Error(`No scrollable ancestor found for element: ${elementNode}`);
+    }
+
+    const scrollInfo = await scrollableElement.evaluate(el => {
+      return {
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight,
+      };
+    });
+
+    return [scrollInfo.scrollTop, scrollInfo.clientHeight, scrollInfo.scrollHeight];
+  }
+
+  /**
+   * Find the nearest scrollable ancestor of the given element
+   * @param element The element to start searching from
+   * @returns The nearest scrollable ancestor or null if none found
+   */
+  private async _findNearestScrollableElement(element: ElementHandle): Promise<ElementHandle | null> {
+    if (!this._puppeteerPage) {
+      return null;
+    }
+
+    // Check if the current element is scrollable
+    const isScrollable = await element.evaluate((el: Element) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const style = window.getComputedStyle(el);
+      const hasVerticalScrollbar = el.scrollHeight > el.clientHeight;
+      const canScrollVertically =
+        style.overflowY === 'scroll' ||
+        style.overflowY === 'auto' ||
+        style.overflow === 'scroll' ||
+        style.overflow === 'auto';
+
+      return hasVerticalScrollbar && canScrollVertically;
+    });
+
+    if (isScrollable) {
+      return element;
+    }
+
+    // Check parent elements
+    let currentElement: ElementHandle<Element> | null = element;
+
+    try {
+      while (currentElement) {
+        // Get the parent element (as an ElementHandle) of the current element
+        const parentHandle = (await currentElement.evaluateHandle(
+          (el: Element) => el.parentElement,
+        )) as ElementHandle<Element> | null;
+
+        const parentElement = parentHandle ? await parentHandle.asElement() : null;
+
+        if (!parentElement) {
+          // Reached the root without finding a scrollable ancestor
+          currentElement = null;
+          break;
+        }
+
+        const parentIsScrollable = await parentElement.evaluate((el: Element) => {
+          if (!(el instanceof HTMLElement)) return false;
+          const style = window.getComputedStyle(el);
+          const hasVerticalScrollbar = el.scrollHeight > el.clientHeight;
+          const canScrollVertically =
+            ['scroll', 'auto'].includes(style.overflowY) || ['scroll', 'auto'].includes(style.overflow);
+
+          return hasVerticalScrollbar && canScrollVertically;
+        });
+
+        if (parentIsScrollable) {
+          // Found a scrollable ancestor – return it (the caller should dispose when finished)
+          return parentElement;
+        }
+
+        // Move up the DOM tree – dispose the previous element handle before continuing
+        if (currentElement !== element) {
+          try {
+            await currentElement.dispose();
+          } catch (disposeErr) {
+            logger.debug('Failed to dispose element handle:', disposeErr);
+          }
+        }
+
+        currentElement = parentElement;
+      }
+    } catch (error) {
+      // Error accessing parent, break out of loop
+      logger.error('Error finding scrollable parent:', error);
+    }
+
+    // If no scrollable ancestor found, return the document body or documentElement
+    try {
+      const bodyElement = await this._puppeteerPage.$('body');
+      if (bodyElement) {
+        const bodyIsScrollable = await bodyElement.evaluate(el => {
+          if (!(el instanceof HTMLElement)) return false;
+          return el.scrollHeight > el.clientHeight;
+        });
+        if (bodyIsScrollable) {
+          return bodyElement;
+        }
+      }
+
+      // Last resort: return document element for page-level scrolling
+      const documentElement = await this._puppeteerPage.evaluateHandle(() => document.documentElement);
+      const docElement = (await documentElement.asElement()) as ElementHandle<Element> | null;
+      return docElement;
+    } catch (error) {
+      logger.error('Failed to find scrollable element:', error);
+      return null;
+    }
   }
 
   async getContent(): Promise<string> {
@@ -190,31 +334,48 @@ export default class Page {
     return await this._puppeteerPage.content();
   }
 
-  async getMarkdownContent(selector?: string): Promise<string> {
-    if (!this._validWebPage) {
-      return '';
-    }
-    return _getMarkdownContent(this._tabId, selector);
+  getCachedState(): PageState | null {
+    return this._cachedState;
   }
 
-  async getReadabilityContent(): Promise<ReadabilityResult> {
-    if (!this._validWebPage) {
-      return '';
-    }
-    return _getReadabilityContent(this._tabId);
-  }
-
-  async getState(): Promise<PageState> {
+  async getState(useVision = false, cacheClickableElementsHashes = false): Promise<PageState> {
     if (!this._validWebPage) {
       // return the initial state
       return build_initial_state(this._tabId);
     }
     await this.waitForPageAndFramesLoad();
-    const state = await this._updateState();
-    return state;
+    const updatedState = await this._updateState(useVision);
+
+    // Find out which elements are new
+    // Do this only if url has not changed
+    if (cacheClickableElementsHashes) {
+      // If we are on the same url as the last state, we can use the cached hashes
+      if (
+        this._cachedStateClickableElementsHashes &&
+        this._cachedStateClickableElementsHashes.url === updatedState.url
+      ) {
+        // Get clickable elements from the updated state
+        const updatedStateClickableElements = ClickableElementProcessor.getClickableElements(updatedState.elementTree);
+
+        // Mark elements as new if they weren't in the previous state
+        for (const domElement of updatedStateClickableElements) {
+          const hash = await ClickableElementProcessor.hashDomElement(domElement);
+          domElement.isNew = !this._cachedStateClickableElementsHashes.hashes.has(hash);
+        }
+      }
+
+      // In any case, we need to cache the new hashes
+      const newHashes = await ClickableElementProcessor.getClickableElementsHashes(updatedState.elementTree);
+      this._cachedStateClickableElementsHashes = new CachedStateClickableElementsHashes(updatedState.url, newHashes);
+    }
+
+    // Save the updated state as the cached state
+    this._cachedState = updatedState;
+
+    return updatedState;
   }
 
-  async _updateState(useVision = true, focusElement = -1): Promise<PageState> {
+  async _updateState(useVision = false, focusElement = -1): Promise<PageState> {
     try {
       // Test if page is still accessible
       // @ts-expect-error - puppeteerPage is not null, already checked before calling this function
@@ -236,7 +397,9 @@ export default class Page {
 
       // Get DOM content (equivalent to dom_service.get_clickable_elements)
       // This part would need to be implemented based on your DomService logic
-      const content = await this.getClickableElements(focusElement);
+      // showHighlightElements is true if either useVision or displayHighlights is true
+      const displayHighlights = this._config.displayHighlights || useVision;
+      const content = await this.getClickableElements(displayHighlights, focusElement);
       if (!content) {
         logger.warning('Failed to get clickable elements');
         // Return last known good state if available
@@ -256,7 +419,7 @@ export default class Page {
 
       // Take screenshot if needed
       const screenshot = useVision ? await this.takeScreenshot() : null;
-      const [pixelsAbove, pixelsBelow] = await this.getScrollInfo();
+      const [scrollY, visualViewportHeight, scrollHeight] = await this.getScrollInfo();
 
       // update the state
       this._state.elementTree = content.elementTree;
@@ -264,8 +427,9 @@ export default class Page {
       this._state.url = this._puppeteerPage?.url() || '';
       this._state.title = (await this._puppeteerPage?.title()) || '';
       this._state.screenshot = screenshot;
-      this._state.pixelsAbove = pixelsAbove;
-      this._state.pixelsBelow = pixelsBelow;
+      this._state.scrollY = scrollY;
+      this._state.visualViewportHeight = visualViewportHeight;
+      this._state.scrollHeight = scrollHeight;
       return this._state;
     } catch (error) {
       logger.error('Failed to update state:', error);
@@ -339,18 +503,26 @@ export default class Page {
     }
     logger.info('navigateTo', url);
 
+    // Check if URL is allowed
+    if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
+      throw new URLNotAllowedError(`URL: ${url} is not allowed`);
+    }
+
     try {
       await Promise.all([this.waitForPageAndFramesLoad(), this._puppeteerPage.goto(url)]);
       logger.info('navigateTo complete');
     } catch (error) {
-      // Check if it's a timeout error
+      if (error instanceof URLNotAllowedError) {
+        throw error;
+      }
+
       if (error instanceof Error && error.message.includes('timeout')) {
         logger.warning('Navigation timeout, but page might still be usable:', error);
-        // You might want to check if the page is actually loaded despite the timeout
-      } else {
-        logger.error('Navigation failed:', error);
-        throw error; // Re-throw non-timeout errors
+        return;
       }
+
+      logger.error('Navigation failed:', error);
+      throw error;
     }
   }
 
@@ -361,12 +533,17 @@ export default class Page {
       await Promise.all([this.waitForPageAndFramesLoad(), this._puppeteerPage.reload()]);
       logger.info('Page refresh complete');
     } catch (error) {
-      if (error instanceof Error && error.message.includes('timeout')) {
-        logger.warning('Refresh timeout, but page might still be usable:', error);
-      } else {
-        logger.error('Page refresh failed:', error);
+      if (error instanceof URLNotAllowedError) {
         throw error;
       }
+
+      if (error instanceof Error && error.message.includes('timeout')) {
+        logger.warning('Refresh timeout, but page might still be usable:', error);
+        return;
+      }
+
+      logger.error('Page refresh failed:', error);
+      throw error;
     }
   }
 
@@ -377,12 +554,17 @@ export default class Page {
       await Promise.all([this.waitForPageAndFramesLoad(), this._puppeteerPage.goBack()]);
       logger.info('Navigation back completed');
     } catch (error) {
-      if (error instanceof Error && error.message.includes('timeout')) {
-        logger.warning('Back navigation timeout, but page might still be usable:', error);
-      } else {
-        logger.error('Could not navigate back:', error);
+      if (error instanceof URLNotAllowedError) {
         throw error;
       }
+
+      if (error instanceof Error && error.message.includes('timeout')) {
+        logger.warning('Back navigation timeout, but page might still be usable:', error);
+        return;
+      }
+
+      logger.error('Could not navigate back:', error);
+      throw error;
     }
   }
 
@@ -393,32 +575,148 @@ export default class Page {
       await Promise.all([this.waitForPageAndFramesLoad(), this._puppeteerPage.goForward()]);
       logger.info('Navigation forward completed');
     } catch (error) {
-      if (error instanceof Error && error.message.includes('timeout')) {
-        logger.warning('Forward navigation timeout, but page might still be usable:', error);
-      } else {
-        logger.error('Could not navigate forward:', error);
+      if (error instanceof URLNotAllowedError) {
         throw error;
       }
+
+      if (error instanceof Error && error.message.includes('timeout')) {
+        logger.warning('Forward navigation timeout, but page might still be usable:', error);
+        return;
+      }
+
+      logger.error('Could not navigate forward:', error);
+      throw error;
     }
   }
 
-  async scrollDown(amount?: number): Promise<void> {
-    if (this._puppeteerPage) {
-      if (amount) {
-        await this._puppeteerPage?.evaluate(`window.scrollBy(0, ${amount});`);
-      } else {
-        await this._puppeteerPage?.evaluate('window.scrollBy(0, window.innerHeight);');
+  // scroll to a percentage of the page or element
+  // if yPercent is 0, scroll to the top of the page, if 100, scroll to the bottom of the page
+  // if elementNode is provided, scroll to a percentage of the element
+  // if elementNode is not provided, scroll to a percentage of the page
+  async scrollToPercent(yPercent: number, elementNode?: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+    if (!elementNode) {
+      await this._puppeteerPage.evaluate(yPercent => {
+        const scrollHeight = document.documentElement.scrollHeight;
+        const viewportHeight = window.visualViewport?.height || window.innerHeight;
+        const scrollTop = (scrollHeight - viewportHeight) * (yPercent / 100);
+        window.scrollTo({
+          top: scrollTop,
+          left: window.scrollX,
+          behavior: 'smooth',
+        });
+      }, yPercent);
+    } else {
+      const element = await this.locateElement(elementNode);
+      if (!element) {
+        throw new Error(`Element: ${elementNode} not found`);
       }
+
+      // Find the nearest scrollable ancestor
+      const scrollableElement = await this._findNearestScrollableElement(element);
+      if (!scrollableElement) {
+        throw new Error(`No scrollable ancestor found for element: ${elementNode}`);
+      }
+
+      await scrollableElement.evaluate((el, yPercent) => {
+        const scrollHeight = el.scrollHeight;
+        const viewportHeight = el.clientHeight;
+        const scrollTop = (scrollHeight - viewportHeight) * (yPercent / 100);
+        el.scrollTo({
+          top: scrollTop,
+          left: el.scrollLeft,
+          behavior: 'smooth',
+        });
+      }, yPercent);
     }
   }
 
-  async scrollUp(amount?: number): Promise<void> {
-    if (this._puppeteerPage) {
-      if (amount) {
-        await this._puppeteerPage?.evaluate(`window.scrollBy(0, -${amount});`);
-      } else {
-        await this._puppeteerPage?.evaluate('window.scrollBy(0, -window.innerHeight);');
+  async scrollBy(y: number, elementNode?: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+    if (!elementNode) {
+      await this._puppeteerPage.evaluate(y => {
+        window.scrollBy({
+          top: y,
+          left: 0,
+          behavior: 'smooth',
+        });
+      }, y);
+    } else {
+      const element = await this.locateElement(elementNode);
+      if (!element) {
+        throw new Error(`Element: ${elementNode} not found`);
       }
+
+      // Find the nearest scrollable ancestor
+      const scrollableElement = await this._findNearestScrollableElement(element);
+      if (!scrollableElement) {
+        throw new Error(`No scrollable ancestor found for element: ${elementNode}`);
+      }
+      await scrollableElement.evaluate(el => {
+        el.scrollBy({
+          top: y,
+          left: 0,
+          behavior: 'smooth',
+        });
+      });
+    }
+  }
+
+  async scrollToPreviousPage(elementNode?: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+
+    if (!elementNode) {
+      // Scroll the whole page up by viewport height
+      await this._puppeteerPage.evaluate('window.scrollBy(0, -(window.visualViewport?.height || window.innerHeight));');
+    } else {
+      // Scroll the specific element up by its client height
+      const element = await this.locateElement(elementNode);
+      if (!element) {
+        throw new Error(`Element: ${elementNode} not found`);
+      }
+
+      // Find the nearest scrollable ancestor
+      const scrollableElement = await this._findNearestScrollableElement(element);
+      if (!scrollableElement) {
+        throw new Error(`No scrollable ancestor found for element: ${elementNode}`);
+      }
+
+      await scrollableElement.evaluate(el => {
+        el.scrollBy(0, -el.clientHeight);
+      });
+    }
+  }
+
+  async scrollToNextPage(elementNode?: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+
+    if (!elementNode) {
+      // Scroll the whole page down by viewport height
+      await this._puppeteerPage.evaluate('window.scrollBy(0, (window.visualViewport?.height || window.innerHeight));');
+    } else {
+      // Scroll the specific element down by its client height
+      const element = await this.locateElement(elementNode);
+      if (!element) {
+        throw new Error(`Element: ${elementNode} not found`);
+      }
+
+      // Find the nearest scrollable ancestor
+      const scrollableElement = await this._findNearestScrollableElement(element);
+      if (!scrollableElement) {
+        throw new Error(`No scrollable ancestor found for element: ${elementNode}`);
+      }
+
+      await scrollableElement.evaluate(el => {
+        el.scrollBy(0, el.clientHeight);
+      });
     }
   }
 
@@ -462,6 +760,20 @@ export default class Page {
 
   private _convertKey(key: string): KeyInput {
     const lowerKey = key.trim().toLowerCase();
+    const isMac = navigator.userAgent.toLowerCase().includes('mac os x');
+
+    if (isMac) {
+      if (lowerKey === 'control' || lowerKey === 'ctrl') {
+        return 'Meta' as KeyInput; // Use Command key on Mac
+      }
+      if (lowerKey === 'command' || lowerKey === 'cmd') {
+        return 'Meta' as KeyInput; // Map Command/Cmd to Meta on Mac
+      }
+      if (lowerKey === 'option' || lowerKey === 'opt') {
+        return 'Alt' as KeyInput; // Map Option/Opt to Alt on Mac
+      }
+    }
+
     const keyMap: { [key: string]: string } = {
       // Letters
       a: 'KeyA',
@@ -525,35 +837,68 @@ export default class Page {
     return convertedKey as KeyInput;
   }
 
-  async scrollToText(text: string): Promise<boolean> {
+  async scrollToText(text: string, nth: number = 1): Promise<boolean> {
     if (!this._puppeteerPage) {
       throw new Error('Puppeteer is not connected');
     }
 
     try {
-      // Try different locator strategies
+      // Convert text to lowercase for consistent searching
+      const lowerCaseText = text.toLowerCase();
+
+      // Try different locator strategies to find all elements containing the text
       const selectors = [
-        // Using text selector (equivalent to get_by_text)
+        // Using text selector (equivalent to get_by_text) - for exact text match
         `::-p-text(${text})`,
         // Using XPath selector (contains text) - case insensitive
-        `::-p-xpath(//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '${text.toLowerCase()}')])`,
+        `::-p-xpath(//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '${lowerCaseText}')])`,
       ];
 
       for (const selector of selectors) {
         try {
-          const element = await this._puppeteerPage.$(selector);
-          if (element) {
-            // Check if element is visible
-            const isVisible = await element.evaluate(el => {
-              const style = window.getComputedStyle(el);
-              return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-            });
+          // Use $$ to get all matching elements
+          const elements = await this._puppeteerPage.$$(selector);
 
-            if (isVisible) {
-              await this._scrollIntoViewIfNeeded(element);
+          if (elements.length > 0) {
+            // Find visible elements and select the nth occurrence
+            const visibleElements = [];
+
+            for (const element of elements) {
+              const isVisible = await element.evaluate(el => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return (
+                  style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  style.opacity !== '0' &&
+                  rect.width > 0 &&
+                  rect.height > 0
+                );
+              });
+
+              if (isVisible) {
+                visibleElements.push(element);
+              }
+            }
+
+            // Check if we have enough visible elements for the requested nth occurrence
+            if (visibleElements.length >= nth) {
+              const targetElement = visibleElements[nth - 1]; // Convert to 0-indexed
+              await this._scrollIntoViewIfNeeded(targetElement);
               await new Promise(resolve => setTimeout(resolve, 500)); // Wait for scroll to complete
+
+              // Dispose of all element handles to prevent memory leaks
+              for (const element of elements) {
+                await element.dispose();
+              }
+
               return true;
             }
+          }
+
+          // Dispose of all element handles to prevent memory leaks
+          for (const element of elements) {
+            await element.dispose();
           }
         } catch (e) {
           logger.debug(`Locator attempt failed: ${e}`);
@@ -712,17 +1057,40 @@ export default class Page {
         return null;
       }
       currentFrame = frame;
+      logger.info('currentFrame changed', currentFrame);
     }
 
     const cssSelector = element.enhancedCssSelectorForElement(this._config.includeDynamicAttributes);
 
     try {
-      const elementHandle: ElementHandle | null = await currentFrame.$(cssSelector);
+      // Try CSS selector first
+      let elementHandle: ElementHandle | null = await currentFrame.$(cssSelector);
+
+      // If CSS selector failed, try XPath
+      if (!elementHandle) {
+        const xpath = element.xpath;
+        if (xpath) {
+          try {
+            logger.info('Trying XPath selector:', xpath);
+            const fullXpath = xpath.startsWith('/') ? xpath : `/${xpath}`;
+            const xpathSelector = `::-p-xpath(${fullXpath})`;
+            elementHandle = await currentFrame.$(xpathSelector);
+          } catch (xpathError) {
+            logger.error('Failed to locate element using XPath:', xpathError);
+          }
+        }
+      }
+
+      // If element found, check visibility and scroll into view
       if (elementHandle) {
-        // Scroll element into view if needed
-        await this._scrollIntoViewIfNeeded(elementHandle);
+        const isHidden = await elementHandle.isHidden();
+        if (!isHidden) {
+          await this._scrollIntoViewIfNeeded(elementHandle);
+        }
         return elementHandle;
       }
+
+      logger.info('elementHandle not located');
     } catch (error) {
       logger.error('Failed to locate element:', error);
     }
@@ -737,38 +1105,133 @@ export default class Page {
 
     try {
       // Highlight before typing
-      if (elementNode.highlightIndex !== undefined) {
-        await this._updateState(useVision, elementNode.highlightIndex);
-      }
+      // if (elementNode.highlightIndex != null) {
+      //   await this._updateState(useVision, elementNode.highlightIndex);
+      // }
 
       const element = await this.locateElement(elementNode);
       if (!element) {
         throw new Error(`Element: ${elementNode} not found`);
       }
 
-      // Scroll element into view if needed
-      await this._scrollIntoViewIfNeeded(element);
+      // Ensure element is ready for input
+      try {
+        // First wait for element stability
+        await this._waitForElementStability(element, 1500);
 
-      // Clear the input field (equivalent to fill(''))
-      await element.evaluate(el => {
-        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-          el.value = '';
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
+        // Then check visibility and scroll into view if needed
+        const isHidden = await element.isHidden();
+        if (!isHidden) {
+          await this._scrollIntoViewIfNeeded(element, 1500);
         }
+      } catch (e) {
+        // Continue even if these operations fail
+        logger.debug(`Non-critical error preparing element: ${e}`);
+      }
+
+      // Get element properties to determine input method
+      const tagName = await element.evaluate(el => el.tagName.toLowerCase());
+      const isContentEditable = await element.evaluate(el => {
+        if (el instanceof HTMLElement) {
+          return el.isContentEditable;
+        }
+        return false;
+      });
+      const isReadOnly = await element.evaluate(el => {
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          return el.readOnly;
+        }
+        return false;
+      });
+      const isDisabled = await element.evaluate(el => {
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          return el.disabled;
+        }
+        return false;
       });
 
-      // Type the text
-      await element.type(text);
-      // Wait for stable state ?
+      // Choose appropriate input method based on element properties
+      if ((isContentEditable || tagName === 'input') && !isReadOnly && !isDisabled) {
+        // Clear content and set value directly
+        await element.evaluate(el => {
+          if (el instanceof HTMLElement) {
+            el.textContent = '';
+          }
+          if ('value' in el) {
+            (el as HTMLInputElement).value = '';
+          }
+          // Dispatch events
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+
+        // Type the text with a small delay between keypresses
+        await element.type(text, { delay: 50 });
+      } else {
+        // Use direct value setting for other types of elements
+        await element.evaluate((el, value) => {
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            el.value = value;
+          } else if (el instanceof HTMLElement && el.isContentEditable) {
+            el.textContent = value;
+          }
+          // Dispatch events
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, text);
+      }
+
+      // Wait for page stability after input
+      await this.waitForPageAndFramesLoad();
     } catch (error) {
-      throw new Error(
-        `Failed to input text into element: ${elementNode}. Error: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const errorMsg = `Failed to input text into element: ${elementNode}. Error: ${error instanceof Error ? error.message : String(error)}`;
+      logger.error(errorMsg);
+      throw new Error(errorMsg);
     }
   }
 
-  private async _scrollIntoViewIfNeeded(element: ElementHandle, timeout = 2500): Promise<void> {
+  /**
+   * Wait for an element to become stable (no position/size changes)
+   * Similar to Playwright's wait_for_element_state('stable')
+   */
+  private async _waitForElementStability(element: ElementHandle, timeout = 1000): Promise<void> {
+    const startTime = Date.now();
+    let lastRect = await element.boundingBox();
+
+    while (Date.now() - startTime < timeout) {
+      // Wait a short time
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Get current position and size
+      const currentRect = await element.boundingBox();
+
+      // If element is no longer in DOM or not visible
+      if (!currentRect) {
+        break;
+      }
+
+      // Compare with previous position/size
+      if (
+        lastRect &&
+        Math.abs(lastRect.x - currentRect.x) < 2 &&
+        Math.abs(lastRect.y - currentRect.y) < 2 &&
+        Math.abs(lastRect.width - currentRect.width) < 2 &&
+        Math.abs(lastRect.height - currentRect.height) < 2
+      ) {
+        // Position is stable - wait a bit more to be sure and then return
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return;
+      }
+
+      // Update last position
+      lastRect = currentRect;
+    }
+
+    // If we got here, either the element stabilized or we timed out
+    logger.debug('Element stability check completed (timeout or stable)');
+  }
+
+  private async _scrollIntoViewIfNeeded(element: ElementHandle, timeout = 1000): Promise<void> {
     const startTime = Date.now();
 
     // eslint-disable-next-line no-constant-condition
@@ -808,9 +1271,10 @@ export default class Page {
 
       if (isVisible) break;
 
-      // Check timeout
+      // Check timeout - log warning and return instead of throwing
       if (Date.now() - startTime > timeout) {
-        throw new Error('Timed out while trying to scroll element into view');
+        logger.warning('Timed out while trying to scroll element into view, continuing anyway');
+        break;
       }
 
       // Small delay before next check
@@ -825,9 +1289,9 @@ export default class Page {
 
     try {
       // Highlight before clicking
-      if (elementNode.highlightIndex !== undefined) {
-        await this._updateState(useVision, elementNode.highlightIndex);
-      }
+      // if (elementNode.highlightIndex !== null) {
+      //   await this._updateState(useVision, elementNode.highlightIndex);
+      // }
 
       const element = await this.locateElement(elementNode);
       if (!element) {
@@ -843,12 +1307,21 @@ export default class Page {
           element.click(),
           new Promise((_, reject) => setTimeout(() => reject(new Error('Click timeout')), 2000)),
         ]);
+        await this._checkAndHandleNavigation();
       } catch (error) {
+        // if URLNotAllowedError, throw it
+        if (error instanceof URLNotAllowedError) {
+          throw error;
+        }
         // Second attempt: Use evaluate to perform a direct click
         logger.info('Failed to click element, trying again', error);
         try {
           await element.evaluate(el => (el as HTMLElement).click());
         } catch (secondError) {
+          // if URLNotAllowedError, throw it
+          if (secondError instanceof URLNotAllowedError) {
+            throw secondError;
+          }
           throw new Error(
             `Failed to click element: ${secondError instanceof Error ? secondError.message : String(secondError)}`,
           );
@@ -862,7 +1335,12 @@ export default class Page {
   }
 
   getSelectorMap(): Map<number, DOMElementNode> {
-    return this._state.selectorMap;
+    // If there is no cached state, return an empty map
+    if (this._cachedState === null) {
+      return new Map();
+    }
+    // Otherwise return the cached state's selector map
+    return this._cachedState.selectorMap;
   }
 
   async getElementByIndex(index: number): Promise<ElementHandle | null> {
@@ -1087,8 +1565,16 @@ export default class Page {
     // Wait for page load
     try {
       await this._waitForStableNetwork();
+
+      // Check if the loaded URL is allowed
+      if (this._puppeteerPage) {
+        await this._checkAndHandleNavigation();
+      }
     } catch (error) {
-      console.warn('Page load failed, continuing...');
+      if (error instanceof URLNotAllowedError) {
+        throw error;
+      }
+      console.warn('Page load failed, continuing...', error);
     }
 
     // Calculate remaining time to meet minimum wait time
@@ -1103,6 +1589,34 @@ export default class Page {
     // Sleep remaining time if needed
     if (remaining > 0) {
       await new Promise(resolve => setTimeout(resolve, remaining * 1000)); // Convert seconds to milliseconds
+    }
+  }
+
+  /**
+   * Check the current page URL and handle if it's not allowed
+   * @throws URLNotAllowedError if the current URL is not allowed
+   */
+  private async _checkAndHandleNavigation(): Promise<void> {
+    if (!this._puppeteerPage) {
+      return;
+    }
+
+    const currentUrl = this._puppeteerPage.url();
+    if (!isUrlAllowed(currentUrl, this._config.allowedUrls, this._config.deniedUrls)) {
+      const errorMessage = `URL: ${currentUrl} is not allowed`;
+      logger.error(errorMessage);
+
+      // Navigate to home page or about:blank
+      const safeUrl = this._config.homePageUrl || 'about:blank';
+      logger.info(`Redirecting to safe URL: ${safeUrl}`);
+
+      try {
+        await this._puppeteerPage.goto(safeUrl);
+      } catch (error) {
+        logger.error(`Failed to redirect to safe URL: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      throw new URLNotAllowedError(errorMessage);
     }
   }
 }

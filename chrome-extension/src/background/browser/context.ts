@@ -1,11 +1,19 @@
 import 'webextension-polyfill';
-import { type BrowserContextConfig, type BrowserState, DEFAULT_BROWSER_CONTEXT_CONFIG, type TabInfo } from './types';
+import {
+  type BrowserContextConfig,
+  type BrowserState,
+  DEFAULT_BROWSER_CONTEXT_CONFIG,
+  type TabInfo,
+  URLNotAllowedError,
+} from './views';
 import Page, { build_initial_state } from './page';
 import { createLogger } from '@src/background/log';
+import { isUrlAllowed } from './util';
+import { analytics } from '../services/analytics';
 
 const logger = createLogger('BrowserContext');
 export default class BrowserContext {
-  private readonly _config: BrowserContextConfig;
+  private _config: BrowserContextConfig;
   private _currentTabId: number | null = null;
   private _attachedPages: Map<number, Page> = new Map();
 
@@ -15,6 +23,10 @@ export default class BrowserContext {
 
   public getConfig(): BrowserContextConfig {
     return this._config;
+  }
+
+  public updateConfig(config: Partial<BrowserContextConfig>): void {
+    this._config = { ...this._config, ...config };
   }
 
   public updateCurrentTabId(tabId: number): void {
@@ -219,6 +231,13 @@ export default class BrowserContext {
   }
 
   public async navigateTo(url: string): Promise<void> {
+    if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
+      throw new URLNotAllowedError(`URL: ${url} is not allowed`);
+    }
+
+    // Track domain visit for analytics
+    void analytics.trackDomainVisit(url);
+
     const page = await this.getCurrentPage();
     if (!page) {
       await this.openTab(url);
@@ -242,6 +261,10 @@ export default class BrowserContext {
   }
 
   public async openTab(url: string): Promise<Page> {
+    if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
+      throw new URLNotAllowedError(`Open tab failed. URL: ${url} is not allowed`);
+    }
+
     // Create the new tab
     const tab = await chrome.tabs.create({ url, active: true });
     if (!tab.id) {
@@ -297,14 +320,33 @@ export default class BrowserContext {
     return tabInfos;
   }
 
-  public async getState(): Promise<BrowserState> {
+  public async getCachedState(useVision = false, cacheClickableElementsHashes = false): Promise<BrowserState> {
     const currentPage = await this.getCurrentPage();
 
-    const pageState = !currentPage ? build_initial_state() : await currentPage.getState();
+    let pageState = !currentPage ? build_initial_state() : currentPage.getCachedState();
+    if (!pageState) {
+      pageState = await currentPage.getState(useVision, cacheClickableElementsHashes);
+    }
+
     const tabInfos = await this.getTabInfos();
     const browserState: BrowserState = {
       ...pageState,
       tabs: tabInfos,
+    };
+    return browserState;
+  }
+
+  public async getState(useVision = false, cacheClickableElementsHashes = false): Promise<BrowserState> {
+    const currentPage = await this.getCurrentPage();
+
+    const pageState = !currentPage
+      ? build_initial_state()
+      : await currentPage.getState(useVision, cacheClickableElementsHashes);
+    const tabInfos = await this.getTabInfos();
+    const browserState: BrowserState = {
+      ...pageState,
+      tabs: tabInfos,
+      // browser_errors: [],
     };
     return browserState;
   }

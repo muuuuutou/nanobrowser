@@ -4,8 +4,18 @@ import { z } from 'zod';
 import type { AgentOutput } from '../types';
 import { HumanMessage } from '@langchain/core/messages';
 import { Actors, ExecutionState } from '../event/types';
-import { isAuthenticationError } from '@src/background/utils';
-import { ChatModelAuthError } from './errors';
+import {
+  ChatModelAuthError,
+  ChatModelBadRequestError,
+  ChatModelForbiddenError,
+  isAbortedError,
+  isAuthenticationError,
+  isBadRequestError,
+  isForbiddenError,
+  LLM_FORBIDDEN_ERROR_MESSAGE,
+  RequestCancelledError,
+} from './errors';
+import { filterExternalContent } from '../messages/utils';
 const logger = createLogger('PlannerAgent');
 
 // Define Zod schema for planner output
@@ -21,6 +31,7 @@ export const plannerOutputSchema = z.object({
     }),
   ]),
   next_steps: z.string(),
+  final_answer: z.string(),
   reasoning: z.string(),
   web_task: z.union([
     z.boolean(),
@@ -70,18 +81,46 @@ export class PlannerAgent extends BaseAgent<typeof plannerOutputSchema, PlannerO
       if (!modelOutput) {
         throw new Error('Failed to validate planner output');
       }
-      this.context.emitEvent(Actors.PLANNER, ExecutionState.STEP_OK, modelOutput.next_steps);
+
+      // clean the model output
+      const observation = filterExternalContent(modelOutput.observation);
+      const final_answer = filterExternalContent(modelOutput.final_answer);
+      const next_steps = filterExternalContent(modelOutput.next_steps);
+      const challenges = filterExternalContent(modelOutput.challenges);
+      const reasoning = filterExternalContent(modelOutput.reasoning);
+
+      const cleanedPlan: PlannerOutput = {
+        ...modelOutput,
+        observation,
+        challenges,
+        reasoning,
+        final_answer,
+        next_steps,
+      };
+
+      // If task is done, emit the final answer; otherwise emit next steps
+      const eventMessage = cleanedPlan.done ? cleanedPlan.final_answer : cleanedPlan.next_steps;
+      this.context.emitEvent(Actors.PLANNER, ExecutionState.STEP_OK, eventMessage);
+      logger.info('Planner output', JSON.stringify(cleanedPlan, null, 2));
 
       return {
         id: this.id,
-        result: modelOutput,
+        result: cleanedPlan,
       };
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
       // Check if this is an authentication error
       if (isAuthenticationError(error)) {
-        throw new ChatModelAuthError('Planner API Authentication failed. Please verify your API key', error);
+        throw new ChatModelAuthError(errorMessage, error);
+      } else if (isBadRequestError(error)) {
+        throw new ChatModelBadRequestError(errorMessage, error);
+      } else if (isAbortedError(error)) {
+        throw new RequestCancelledError(errorMessage);
+      } else if (isForbiddenError(error)) {
+        throw new ChatModelForbiddenError(LLM_FORBIDDEN_ERROR_MESSAGE, error);
       }
-      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      logger.error(`Planning failed: ${errorMessage}`);
       this.context.emitEvent(Actors.PLANNER, ExecutionState.STEP_FAIL, `Planning failed: ${errorMessage}`);
       return {
         id: this.id,

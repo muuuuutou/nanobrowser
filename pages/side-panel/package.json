@@ -1,6 +1,6 @@
 {
   "name": "@extension/sidepanel",
-  "version": "0.1.1",
+  "version": "0.1.13",
   "description": "chrome extension - side panel",
   "private": true,
   "sideEffects": true,
@@ -20,10 +20,10 @@
   },
   "dependencies": {
     "react-icons": "^5.0.0",
-    "puppeteer-core": "24.1.1",
     "webextension-polyfill": "^0.12.0",
     "@extension/shared": "workspace:*",
-    "@extension/storage": "workspace:*"
+    "@extension/storage": "workspace:*",
+    "@extension/i18n": "workspace:*"
   },
   "devDependencies": {
     "@extension/tailwindcss-config": "workspace:*",
